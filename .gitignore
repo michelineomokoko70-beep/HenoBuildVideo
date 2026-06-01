@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.env
+venv/
+.venv/
+env/
+ENV/
+
+# Node/React
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.eslintcache
+.clear
+
+# Local downloads and temporary files
+downloads/
+temp/
+backend/downloads/
+backend/temp/
+*.mp4
+*.webm
+*.mp3
+*.m4a
+*.mkv
+*.zip
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Executables & Configs
+ngrok.exe
+ngrok.zip
+*.yml
+.vscode/
+.idea/
