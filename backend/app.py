@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_file, Response, stream_with_context, send_from_directory
+from flask import Flask, request, jsonify, send_file, Response, stream_with_context, send_from_directory, redirect
 from flask_cors import CORS
 from utils.downloader import VideoDownloader
 import threading
@@ -13,6 +13,23 @@ from datetime import datetime, timedelta
 from werkzeug.utils import secure_filename
 import re
 import traceback
+from dotenv import load_dotenv
+from supabase import create_client, Client
+
+# Charger les variables d'environnement (.env)
+load_dotenv()
+
+SUPABASE_URL = os.environ.get('SUPABASE_URL')
+SUPABASE_KEY = os.environ.get('SUPABASE_KEY')
+SUPABASE_BUCKET = os.environ.get('SUPABASE_BUCKET', 'videos')
+
+supabase_client = None
+if SUPABASE_URL and SUPABASE_KEY:
+    try:
+        supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        print(f"Supabase connecté avec succès sur {SUPABASE_URL}!")
+    except Exception as e:
+        print(f"Erreur d'initialisation de Supabase: {e}")
 
 # Déterminer le chemin absolu du dossier de build React
 frontend_folder = os.path.abspath(os.path.join(os.path.dirname(__file__), '../frontend/build'))
@@ -79,6 +96,7 @@ class DownloadTask:
         self.filename = None
         self.filepath = None
         self.filesize = 0
+        self.storage_url = None
         
     def to_dict(self):
         """Convertit la tâche en dictionnaire pour l'API"""
@@ -120,7 +138,8 @@ class DownloadTask:
             'created_at': self.created_at,
             'started_at': self.started_at,
             'completed_at': self.completed_at,
-            'error': self.error
+            'error': self.error,
+            'storage_url': self.storage_url
         }
 
 def get_client_ip():
@@ -240,13 +259,67 @@ def start_download_thread(task):
                 task.result = result
                 
                 if result.get('success'):
-                    task.status = 'completed'
                     task.filename = result.get('filename')
                     task.filepath = result.get('path')
                     task.filesize = result.get('size', 0)
                     if not isinstance(task.filesize, (int, float)):
                         task.filesize = 0
                     task.platform = result.get('platform')
+                    
+                    # Téléversement Supabase
+                    if supabase_client and task.filepath and os.path.exists(task.filepath):
+                        try:
+                            task.status = 'uploading'
+                            print(f"[Supabase] Téléversement du fichier {task.filename}...")
+                            
+                            ext = task.filename.rsplit('.', 1)[-1].lower() if '.' in task.filename else 'mp4'
+                            bucket_filename = f"{task.task_id}.{ext}"
+                            
+                            # Content type map
+                            mimetypes_map = {
+                                'mp4': 'video/mp4', 'webm': 'video/webm', 'mkv': 'video/x-matroska',
+                                'mp3': 'audio/mpeg', 'm4a': 'audio/mp4', 'flv': 'video/x-flv'
+                            }
+                            ctype = mimetypes_map.get(ext, 'application/octet-stream')
+                            
+                            with open(task.filepath, 'rb') as f:
+                                supabase_client.storage.from_(SUPABASE_BUCKET).upload(
+                                    path=bucket_filename,
+                                    file=f,
+                                    file_options={"content-type": ctype}
+                                )
+                            
+                            public_url = supabase_client.storage.from_(SUPABASE_BUCKET).get_public_url(bucket_filename)
+                            task.storage_url = public_url
+                            print(f"[Supabase] Téléversé avec succès! URL: {public_url}")
+                            
+                            # Tenter d'insérer dans la table downloads
+                            try:
+                                supabase_client.table('downloads').insert({
+                                    'task_id': task.task_id,
+                                    'url': task.url,
+                                    'title': result.get('title') or task.filename,
+                                    'filename': task.filename,
+                                    'size': task.filesize,
+                                    'platform': task.platform or 'unknown',
+                                    'storage_url': public_url
+                                }).execute()
+                                print("[Supabase] Historique enregistré en base de données.")
+                            except Exception as db_err:
+                                print(f"[Supabase] Info table 'downloads': {db_err}")
+                            
+                            # Supprimer le fichier local
+                            if os.path.exists(task.filepath):
+                                os.remove(task.filepath)
+                                print("[Supabase] Fichier local supprimé du serveur pour libérer de l'espace.")
+                                
+                            task.status = 'completed'
+                        except Exception as upload_err:
+                            print(f"[Supabase] Échec de l'upload (passage en fallback local): {upload_err}")
+                            task.status = 'completed'
+                    else:
+                        task.status = 'completed'
+                        
                     stats['successful_downloads'] += 1
                     stats['total_bytes_downloaded'] += task.filesize
                 else:
@@ -543,6 +616,11 @@ def download_file(task_id):
         if task.status != 'completed':
             return jsonify({'success': False, 'error': 'Téléchargement non terminé'}), 400
         
+        # Si le fichier est déjà téléversé sur Supabase Storage, rediriger directement vers l'URL publique
+        if hasattr(task, 'storage_url') and task.storage_url:
+            print(f"[Supabase] Redirection directe vers l'URL publique : {task.storage_url}")
+            return redirect(task.storage_url)
+            
         filepath = task.filepath
         if not filepath or not os.path.exists(filepath):
             return jsonify({'success': False, 'error': 'Fichier non trouvé sur le disque'}), 404
